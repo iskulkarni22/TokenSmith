@@ -63,6 +63,11 @@ class RAGConfig:
     # user feedback modeling
     enable_topic_extraction: bool = False
 
+    # HyPE (Hypothetical Prompt Embeddings)
+    use_hype: bool = False
+    hype_questions_per_chunk: int = 3
+    hype_generation_model: str = "models/generators/qwen2.5-1.5b-instruct-q5_k_m.gguf"
+
     # ---------- factory + validation ----------
     @classmethod
     def from_yaml(cls, path: os.PathLike) -> RAGConfig:
