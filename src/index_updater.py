@@ -33,6 +33,8 @@ def add_to_index(
     chapters_to_add: List[int],
     use_multiprocessing: bool = False,
     use_headings: bool = False,
+    use_hype: bool = False,
+    hype_config: Optional[Dict] = None,
 ) -> None:
     """
     Adds new chapters to an existing FAISS and BM25 index.
@@ -46,6 +48,7 @@ def add_to_index(
     meta_path = artifacts_dir / f"{index_prefix}_meta.pkl"
     info_path = artifacts_dir / f"{index_prefix}_info.json"
     map_path = artifacts_dir / f"{index_prefix}_page_to_chunk_map.json"
+    vector_map_path = artifacts_dir / f"{index_prefix}_vector_to_chunk_map.pkl"
 
     if not faiss_index_path.exists():
         print("No existing index found. Building a new one...")
@@ -59,6 +62,8 @@ def add_to_index(
             index_prefix=index_prefix,
             use_multiprocessing=use_multiprocessing,
             use_headings=use_headings,
+            use_hype=use_hype,
+            hype_config=hype_config,
             chapters_to_index=chapters_to_add,
         )
         return
@@ -74,6 +79,13 @@ def add_to_index(
         existing_metadata = pickle.load(f)
     with open(info_path, "r") as f:
         index_info = json.load(f)
+    
+    # Load existing vector-to-chunk map if it exists (for HyPE)
+    if vector_map_path.exists():
+        with open(vector_map_path, "rb") as f:
+            existing_vector_map = pickle.load(f)
+    else:
+        existing_vector_map = list(range(len(existing_chunks)))  # Identity mapping
 
     if map_path.exists():
         with open(map_path, "r") as f:
@@ -183,12 +195,63 @@ def add_to_index(
             new_sources.append(markdown_file)
             new_metadata.append(meta)
 
-        total_chunks += len(sub_chunks)
-
-    # Embed new chunks
+    # Embed new chunks with optional HyPE support
     print(f"Embedding {len(new_chunks)} new chunks...")
-    embedder = SentenceTransformer(embedding_model_path)
-    new_embeddings = embedder.encode(new_chunks, batch_size=4, show_progress_bar=True)
+    embedder = SentenceTransformer(embedding_model_path, n_ctx=embedding_model_context_window)
+    
+    new_vectors = []
+    new_vector_map = []
+    base_chunk_id = len(existing_chunks)  # Starting chunk ID for new chunks
+    
+    if use_hype and hype_config:
+        print("\n=== HyPE Multi-Vector Indexing Enabled ===")
+        print(f"Generating {hype_config.get('num_questions', 3)} questions per chunk...")
+        
+        from src.hype_generator import generate_questions_for_chunk
+        from tqdm import tqdm
+        
+        # Step 1: Generate questions
+        print("Step 1/3: Generating questions for new chunks...")
+        all_questions = []
+        for chunk_id, chunk_text in tqdm(enumerate(new_chunks), total=len(new_chunks), desc="Generating questions"):
+            questions = generate_questions_for_chunk(
+                chunk_text,
+                hype_config['model_path'],
+                hype_config.get('num_questions', 3)
+            )
+            all_questions.append(questions)
+        
+        # Step 2: Clear LLM from memory
+        print("Step 2/3: Clearing LLM from memory...")
+        from src.generator import _LLM_CACHE
+        _LLM_CACHE.clear()
+        import gc
+        gc.collect()
+        
+        # Step 3: Embed chunks and questions
+        print("Step 3/3: Embedding chunks and questions...")
+        for local_chunk_id, chunk_text in tqdm(enumerate(new_chunks), total=len(new_chunks), desc="Embedding"):
+            global_chunk_id = base_chunk_id + local_chunk_id
+            
+            # Embed original chunk
+            chunk_emb = embedder.encode([chunk_text])[0]
+            new_vectors.append(chunk_emb)
+            new_vector_map.append(global_chunk_id)
+            
+            # Embed questions
+            questions = all_questions[local_chunk_id]
+            if questions:
+                question_embs = embedder.encode(questions)
+                for q_emb in question_embs:
+                    new_vectors.append(q_emb)
+                    new_vector_map.append(global_chunk_id)
+        
+        print(f"Generated {len(new_vectors)} new vectors ({len(new_chunks)} chunks + questions)")
+        new_embeddings = np.array(new_vectors, dtype=np.float32)
+    else:
+        # Standard single-vector per chunk
+        new_embeddings = embedder.encode(new_chunks, batch_size=4, show_progress_bar=True)
+        new_vector_map = list(range(base_chunk_id, base_chunk_id + len(new_chunks)))
 
     # Add to FAISS index
     faiss_index = faiss.read_index(str(faiss_index_path))
@@ -216,6 +279,14 @@ def add_to_index(
         pickle.dump(all_sources, f)
     with open(meta_path, "wb") as f:
         pickle.dump(all_metadata, f)
+    
+    # Save updated vector-to-chunk map
+    combined_vector_map = existing_vector_map + new_vector_map
+    with open(vector_map_path, "wb") as f:
+        pickle.dump(combined_vector_map, f)
+    
+    if use_hype:
+        print(f"Updated HyPE multi-vector mapping: {len(combined_vector_map)} vectors → {len(all_chunks)} chunks")
 
     # Save updated page-to-chunk map
     final_map = {str(page): sorted(list(id_set)) for page, id_set in page_to_chunk_ids.items()}
