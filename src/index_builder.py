@@ -41,10 +41,16 @@ def build_index(
     index_prefix: str,
     use_multiprocessing: bool = False,
     use_headings: bool = False,
+    use_hype: bool = False,
+    hype_config: Dict = None,
     chapters_to_index: Optional[List[int]] = None
 ) -> None:
     """
     Extract sections, chunk, embed, and build both FAISS and BM25 indexes.
+    
+    If use_hype=True, generates hypothetical questions for each chunk and
+    creates a multi-vector FAISS index where each chunk has multiple embeddings
+    (original chunk + generated questions).
 
     Persists:
         - {prefix}.faiss
@@ -52,6 +58,7 @@ def build_index(
         - {prefix}_chunks.pkl
         - {prefix}_sources.pkl
         - {prefix}_meta.pkl
+        - {prefix}_vector_to_chunk_map.pkl (if use_hype=True)
         - {prefix}_page_to_chunk_map.json
     """
     all_chunks: List[str] = []
@@ -153,23 +160,76 @@ def build_index(
     )
     print(f"Embedding {len(all_chunks):,} chunks sequentially...")
 
-    if use_multiprocessing:
-        print("Starting multi-process pool for embeddings...")
-        pool = embedder.start_multi_process_pool(workers=4)
-        try:
-            embeddings = embedder.encode_multi_process(
-                all_chunks,
-                pool,
-                batch_size=4,
-            )
-        finally:
-            embedder.stop_multi_process_pool(pool)
-    else:
-        embeddings = embedder.encode(
-            all_chunks,
-            show_progress_bar=True,
-        )
+    # Prepare vectors and mapping for multi-vector indexing
+    all_vectors = []
+    vector_to_chunk_map = []  # Maps vector_index → chunk_id
 
+    if use_hype and hype_config:
+        print("\n=== HyPE Multi-Vector Indexing Enabled ===")
+        print(f"Generating {hype_config.get('num_questions', 3)} questions per chunk...")
+        
+        # Import here to avoid circular dependency
+        from src.hype_generator import generate_questions_for_chunk
+        
+        # Step 2a: Generate all questions first (without embeddings loaded)
+        print("Step 1/3: Generating questions for all chunks...")
+        all_questions = []  # List of lists: one list of questions per chunk
+        for chunk_id, chunk_text in tqdm(enumerate(all_chunks), total=len(all_chunks), desc="Generating questions"):
+            questions = generate_questions_for_chunk(
+                chunk_text,
+                hype_config['model_path'],
+                hype_config.get('num_questions', 3)
+            )
+            all_questions.append(questions)
+        
+        # Clear LLM from memory before loading embedder
+        print("Step 2/3: Clearing LLM from memory...")
+        from src.generator import _LLM_CACHE
+        _LLM_CACHE.clear()
+        import gc
+        gc.collect()
+        
+        # Step 2b: Now embed everything with embedder
+        print("Step 3/3: Embedding chunks and questions...")
+        for chunk_id, chunk_text in tqdm(enumerate(all_chunks), total=len(all_chunks), desc="Embedding"):
+            # Embed original chunk
+            chunk_emb = embedder.encode([chunk_text])[0]
+            all_vectors.append(chunk_emb)
+            vector_to_chunk_map.append(chunk_id)
+            
+            # Embed questions for this chunk
+            questions = all_questions[chunk_id]
+            if questions:
+                question_embs = embedder.encode(questions)
+                for q_emb in question_embs:
+                    all_vectors.append(q_emb)
+                    vector_to_chunk_map.append(chunk_id)
+        
+        print(f"Generated {len(all_vectors)} total vectors ({len(all_chunks)} chunks + questions)")
+        embeddings = np.array(all_vectors, dtype=np.float32)
+        
+    else:
+        # Standard single-vector per chunk
+        if use_multiprocessing:
+            print("Starting multi-process pool for embeddings...")
+            pool = embedder.start_multi_process_pool(workers=4)
+            try:
+                embeddings = embedder.encode_multi_process(
+                    all_chunks,
+                    pool,
+                    batch_size=4,
+                )
+            finally:
+                embedder.stop_multi_process_pool(pool)
+        else:
+            embeddings = embedder.encode(
+                all_chunks,
+                show_progress_bar=True,
+            )
+        
+        # Create identity mapping (vector_i → chunk_i)
+        vector_to_chunk_map = list(range(len(all_chunks)))
+        
     # Step 3: Build FAISS index
     print(f"Building FAISS index for {len(all_chunks):,} chunks...")
     dim = embeddings.shape[1]
@@ -193,6 +253,14 @@ def build_index(
         pickle.dump(sources, f)
     with open(artifacts_dir / f"{index_prefix}_meta.pkl", "wb") as f:
         pickle.dump(metadata, f)
+    
+    # Save vector-to-chunk mapping (for multi-vector support)
+    with open(artifacts_dir / f"{index_prefix}_vector_to_chunk_map.pkl", "wb") as f:
+        pickle.dump(vector_to_chunk_map, f)
+    
+    if use_hype:
+        print(f"Saved HyPE multi-vector mapping: {len(vector_to_chunk_map)} vectors → {len(all_chunks)} chunks")
+    
     print(f"Saved all index artifacts with prefix: {index_prefix}")
 
     output_file = artifacts_dir / f"{index_prefix}_info.json"
@@ -208,7 +276,6 @@ def build_index(
     with open(output_file, "w") as f:
         json.dump(index_info, f, indent=2)
     print(f"Saved index information: {output_file}")
-
 # ------------------------ Helper functions ------------------------------
 
 def preprocess_for_bm25(text: str) -> list[str]:
