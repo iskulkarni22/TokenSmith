@@ -76,6 +76,15 @@ def run_index_mode(args: argparse.Namespace, cfg: RAGConfig):
         print("ERROR: No markdown files found in data/.", file=sys.stderr)
         sys.exit(1)
 
+    # Prepare HyPE config if enabled
+    hype_config = None
+    if cfg.use_hype:
+        hype_config = {
+            'model_path': cfg.hype_generation_model,
+            'num_questions': cfg.hype_questions_per_chunk
+        }
+        print(f"\nHyPE enabled: Generating {cfg.hype_questions_per_chunk} questions per chunk")
+
     build_index(
         markdown_file=str(md_files[0]),
         chunker=chunker,
@@ -86,6 +95,8 @@ def run_index_mode(args: argparse.Namespace, cfg: RAGConfig):
         index_prefix=args.index_prefix,
         use_multiprocessing=args.multiproc_indexing,
         use_headings=args.embed_with_headings,
+        use_hype=cfg.use_hype,
+        hype_config=hype_config,
         chapters_to_index=args.chapters,
     )
 
@@ -109,6 +120,15 @@ def run_add_chapters_mode(args: argparse.Namespace, cfg: RAGConfig):
         print("ERROR: No markdown files found in data/.", file=sys.stderr)
         sys.exit(1)
 
+    # Prepare HyPE config if enabled
+    hype_config = None
+    if cfg.use_hype:
+        hype_config = {
+            'model_path': cfg.hype_generation_model,
+            'num_questions': cfg.hype_questions_per_chunk
+        }
+        print(f"\nHyPE enabled: Generating {cfg.hype_questions_per_chunk} questions per chunk")
+
     add_to_index(
         markdown_file=str(md_files[0]),
         chunker=chunker,
@@ -119,6 +139,8 @@ def run_add_chapters_mode(args: argparse.Namespace, cfg: RAGConfig):
         index_prefix=args.index_prefix,
         chapters_to_add=args.chapters,
         use_headings=args.embed_with_headings,
+        use_hype=cfg.use_hype,
+        hype_config=hype_config,
     )
     print("Successfully added chapters to the index.")
 
@@ -379,9 +401,18 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
     try:
         artifacts_dir = cfg.get_artifacts_directory(partial=args.partial)
         cfg.page_to_chunk_map_path = cfg.get_page_to_chunk_map_path(artifacts_dir, args.index_prefix)
-        faiss_idx, bm25_idx, chunks, sources, meta = load_artifacts(artifacts_dir, args.index_prefix)
+        faiss_idx, bm25_idx, chunks, sources, meta, vector_to_chunk_map = load_artifacts(artifacts_dir, args.index_prefix)
         print(f"Loaded {len(chunks)} chunks and {len(sources)} sources from artifacts.")
-        retrievers = [FAISSRetriever(faiss_idx, cfg.embed_model), BM25Retriever(bm25_idx)]
+        
+        # Initialize FAISS retriever with optional multi-vector support
+        retrievers = [
+            FAISSRetriever(faiss_idx, cfg.embed_model, vector_to_chunk_map), 
+            BM25Retriever(bm25_idx)
+        ]
+        
+        if vector_to_chunk_map:
+            print(f"HyPE multi-vector retrieval enabled: {len(vector_to_chunk_map)} vectors → {len(chunks)} chunks")
+        
         if cfg.ranker_weights.get("index_keywords", 0) > 0:
             retrievers.append(IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path))
         
