@@ -203,7 +203,7 @@ async def lifespan(app: FastAPI):
 
     try:
         artifacts_dir = _config.get_artifacts_directory()
-        faiss_index, bm25_index, chunks, sources, metadata = load_artifacts(
+        faiss_index, bm25_index, chunks, sources, metadata, vector_to_chunk_map = load_artifacts(
             artifacts_dir=artifacts_dir,
             index_prefix=INDEX_PREFIX
         )
@@ -215,7 +215,7 @@ async def lifespan(app: FastAPI):
         }
 
         _retrievers = [
-            FAISSRetriever(faiss_index, _config.embed_model),
+            FAISSRetriever(faiss_index, _config.embed_model, vector_to_chunk_map),
             BM25Retriever(bm25_index),
         ]
         
